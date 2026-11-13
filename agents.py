@@ -1,15 +1,11 @@
 
-import os
 import time
-from dotenv import load_dotenv
 from google import genai
 
 
 # ============================================================
-# 1. CONFIGURATION
+# 1. MODEL CONFIGURATION
 # ============================================================
-
-load_dotenv()
 
 MODEL_NAME = "gemini-3.8-flash"
 
@@ -17,53 +13,10 @@ MAX_RETRIES = 3
 
 
 # ============================================================
-# 2. GET GEMINI API KEY
+# 2. SHARED GEMINI GENERATION FUNCTION
 # ============================================================
 
-def get_api_key():
-
-    # First, check environment variables.
-    api_key = os.getenv("GEMINI_API_KEY")
-
-    if api_key:
-        return api_key
-
-    # Then, check Streamlit Cloud secrets.
-    try:
-        import streamlit as st
-
-        api_key = st.secrets.get("GEMINI_API_KEY")
-
-        if api_key:
-            return api_key
-
-    except Exception:
-        pass
-
-    raise ValueError(
-        "GEMINI_API_KEY not found. "
-        "Add it to your .env file or Streamlit Cloud Secrets."
-    )
-
-
-# ============================================================
-# 3. INITIALIZE GEMINI CLIENT
-# ============================================================
-
-def get_gemini_client():
-
-    api_key = get_api_key()
-
-    return genai.Client(api_key=api_key)
-
-
-# ============================================================
-# 4. GEMINI CALL WITH AUTOMATIC RETRIES
-# ============================================================
-
-def generate_with_retry(prompt, agent_name="Agent"):
-
-    client = get_gemini_client()
+def generate_with_retry(client, prompt, agent_name):
 
     for attempt in range(MAX_RETRIES):
 
@@ -75,9 +28,7 @@ def generate_with_retry(prompt, agent_name="Agent"):
             )
 
             if not response or not response.text:
-                raise ValueError(
-                    f"{agent_name} received an empty response from Gemini."
-                )
+                raise ValueError("Gemini returned an empty response.")
 
             return response.text.strip()
 
@@ -97,8 +48,8 @@ def generate_with_retry(prompt, agent_name="Agent"):
             ]
 
             is_temporary = any(
-                error_code in error_message
-                for error_code in temporary_errors
+                code in error_message
+                for code in temporary_errors
             )
 
             if is_temporary and attempt < MAX_RETRIES - 1:
@@ -107,7 +58,8 @@ def generate_with_retry(prompt, agent_name="Agent"):
 
                 print(
                     f"{agent_name}: Temporary Gemini error. "
-                    f"Retrying in {wait_seconds} seconds..."
+                    f"Retrying in {wait_seconds} seconds...",
+                    flush=True
                 )
 
                 time.sleep(wait_seconds)
@@ -115,8 +67,7 @@ def generate_with_retry(prompt, agent_name="Agent"):
             else:
 
                 raise RuntimeError(
-                    f"{agent_name} failed after "
-                    f"{attempt + 1} attempt(s): {error}"
+                    f"{agent_name} failed: {error}"
                 ) from error
 
     raise RuntimeError(
@@ -125,270 +76,272 @@ def generate_with_retry(prompt, agent_name="Agent"):
 
 
 # ============================================================
-# 5. FORMAT SEARCH RESULTS
+# 3. FORMAT RESEARCH SOURCES
 # ============================================================
 
-def format_search_results(search_results):
+def format_sources(sources):
 
-    if not search_results:
-        return ""
+    formatted = []
 
-    formatted_sources = []
+    for index, source in enumerate(sources, start=1):
 
-    for index, item in enumerate(search_results, start=1):
-
-        if isinstance(item, dict):
+        if isinstance(source, dict):
 
             title = (
-                item.get("title")
-                or item.get("heading")
+                source.get("title")
+                or source.get("heading")
                 or "Untitled source"
             )
 
             url = (
-                item.get("href")
-                or item.get("url")
-                or item.get("link")
-                or "URL not provided"
+                source.get("href")
+                or source.get("url")
+                or source.get("link")
+                or "URL unavailable"
             )
 
             description = (
-                item.get("body")
-                or item.get("snippet")
-                or item.get("description")
-                or item.get("content")
+                source.get("body")
+                or source.get("snippet")
+                or source.get("description")
+                or source.get("content")
                 or ""
             )
 
-            source_text = (
-                f"Source {index}\n"
-                f"Title: {title}\n"
-                f"URL: {url}\n"
-                f"Information: {description}"
+            formatted.append(
+                f"""
+Source {index}
+Title: {title}
+URL: {url}
+Information: {description}
+"""
             )
 
         else:
 
-            source_text = f"Source {index}\n{str(item)}"
+            formatted.append(
+                f"Source {index}: {str(source)}"
+            )
 
-        formatted_sources.append(source_text)
-
-    return "\n\n".join(formatted_sources)
+    return "\n\n".join(formatted)
 
 
 # ============================================================
-# 6. RESEARCHER AGENT
+# 4. RESEARCHER AGENT
 # ============================================================
 
-def researcher_agent(topic, search_results, log_callback=None):
+class ResearcherAgent:
+    """
+    Researcher Agent:
+    Extracts factual information from supplied web sources.
+    """
 
-    if log_callback:
-        log_callback(
-            "Researcher Agent: Extracting factual information..."
-        )
+    def __init__(self, client):
 
-    if not search_results:
+        self.client = client
 
-        return (
-            "RESEARCH FAILED\n"
-            "No usable search results were provided. "
-            "The Writer Agent must not invent facts."
-        )
+    def compile_research(self, topic, sources):
 
-    sources = format_search_results(search_results)
+        if not sources:
 
-    prompt = f"""
+            return (
+                "RESEARCH FAILED: "
+                "No usable search sources were provided."
+            )
+
+        source_information = format_sources(sources)
+
+        prompt = f"""
 You are the Researcher Agent in a multi-agent system.
 
-YOUR TASK:
-Research the user's topic using ONLY the supplied search results.
+Your responsibility is to collect and organize factual
+information for the Writer Agent.
 
 USER TOPIC:
 {topic}
 
 SEARCH RESULTS:
-{sources}
+{source_information}
 
-INSTRUCTIONS:
+YOUR TASK:
 
-1. Extract accurate and relevant factual information.
-2. Identify important developments, dates, statistics,
-   organizations, technologies, and findings when available.
-3. Do not invent facts, statistics, dates, or quotations.
-4. Do not use information that is not supported by the sources.
-5. If sources disagree, clearly mention the disagreement.
-6. Keep the original source titles and URLs.
-7. Prefer reliable and authoritative sources.
-8. Remove irrelevant search-result information.
-9. Organize the research notes using clear headings.
-10. Do not write the final blog article.
+1. Extract relevant factual information.
+2. Identify important developments and findings.
+3. Include dates and statistics only when supported.
+4. Do not invent facts or statistics.
+5. Identify the organizations and technologies mentioned.
+6. Preserve source titles and URLs.
+7. Mention conflicting information when sources disagree.
+8. Do not write the final blog article.
+9. Do not use information outside the supplied sources.
 
 OUTPUT FORMAT:
 
 # Research Notes
 
 ## 1. Topic Overview
-Explain the topic using supported information.
 
 ## 2. Important Facts
-List the important factual findings.
 
 ## 3. Recent Developments
-Describe recent developments only when supported
-by the provided sources.
 
 ## 4. Statistics and Evidence
-Include statistics only when they appear in the sources.
-Mention the source for each statistic.
 
 ## 5. Key Findings
-Summarize the most important research findings.
 
 ## 6. Source References
-List the source titles and URLs.
 
 ## 7. Research Limitations
-Mention missing, unclear, or conflicting information.
 
-IMPORTANT:
-Your output will be passed to another AI agent.
-The Writer Agent must be able to understand your notes
-without accessing the internet.
+Your research notes will be passed to the Writer Agent.
+Make them clear, factual, and well organized.
 
-Return research notes only.
+Return only the research notes.
 """
 
-    try:
+        try:
 
-        research_notes = generate_with_retry(
-            prompt,
-            agent_name="Researcher Agent"
-        )
+            research = generate_with_retry(
+                self.client,
+                prompt,
+                "Researcher Agent"
+            )
 
-        if "RESEARCH FAILED" in research_notes.upper():
-            return research_notes
+            return research
 
-        return research_notes
+        except Exception as error:
 
-    except Exception as error:
+            print(
+                f"Researcher Agent Error: {error}",
+                flush=True
+            )
 
-        return (
-            "RESEARCH FAILED\n\n"
-            f"The Researcher Agent could not complete its task.\n"
-            f"Reason: {str(error)}\n\n"
-            "The Writer Agent must not invent facts or "
-            "write an article using unsupported information."
-        )
+            return (
+                "RESEARCH FAILED\n\n"
+                "The Researcher Agent could not complete "
+                "the research because Gemini was unavailable.\n\n"
+                f"Error: {error}\n\n"
+                "The Writer Agent must not invent facts."
+            )
 
 
 # ============================================================
-# 7. WRITER AGENT
+# 5. WRITER AGENT
 # ============================================================
 
-def writer_agent(topic, research_notes, log_callback=None):
+class WriterAgent:
+    """
+    Writer Agent:
+    Creates a professional blog using only research notes.
+    It does not perform internet searches.
+    """
 
-    if log_callback:
-        log_callback(
-            "Writer Agent: Preparing the blog article..."
-        )
+    def __init__(self, client):
 
-    if not research_notes:
+        self.client = client
 
-        return (
-            "The article could not be written because "
-            "the Researcher Agent did not provide research notes."
-        )
+    def write_article(self, topic, research):
 
-    if "RESEARCH FAILED" in research_notes.upper():
+        if not research:
 
-        return (
-            "# Article Not Generated\n\n"
-            "The Researcher Agent could not complete the research. "
-            "The Writer Agent will not invent facts or create "
-            "an article without reliable research."
-        )
+            return (
+                "# Article Not Generated\n\n"
+                "The Researcher Agent did not provide "
+                "research notes."
+            )
 
-    prompt = f"""
+        if "RESEARCH FAILED" in research.upper():
+
+            return (
+                "# Article Not Generated\n\n"
+                "The Researcher Agent could not complete "
+                "the research. Therefore, the Writer Agent "
+                "will not invent facts or generate an "
+                "unsupported article."
+            )
+
+        prompt = f"""
 You are the Writer Agent in a multi-agent system.
 
-YOUR TASK:
-Write a professional blog article of approximately 500 words.
+Your task is to write a professional blog article
+of approximately 500 words.
 
-USER TOPIC:
+TOPIC:
 {topic}
 
-RESEARCH NOTES FROM THE RESEARCHER AGENT:
-{research_notes}
+RESEARCH NOTES PROVIDED BY THE RESEARCHER:
+{research}
 
 IMPORTANT RULES:
 
-1. Use ONLY the research notes provided above.
-2. You do NOT have internet access.
-3. Do NOT perform web searches.
-4. Do NOT invent statistics, dates, events, or facts.
-5. Do NOT add unsupported information from your own knowledge.
-6. If information is missing, do not make it up.
-7. Write in clear, professional, natural English.
-8. Avoid unnecessary repetition.
-9. Make the article informative and easy to understand.
-10. Keep the article approximately 500 words.
+1. Use only the research notes above.
+2. You do not have internet access.
+3. Do not perform web searches.
+4. Do not invent facts, dates, statistics, or events.
+5. Do not add unsupported information.
+6. Write in professional and natural English.
+7. Avoid unnecessary repetition.
+8. Make the article informative and readable.
+9. Target approximately 500 words.
+10. If information is missing, do not make it up.
 
 ARTICLE STRUCTURE:
 
 # Attractive Blog Title
 
 ## Introduction
+
 Introduce the topic and explain its importance.
 
 ## Main Developments
-Explain the important findings from the research.
 
-## Key Impacts and Applications
-Discuss supported real-world effects and applications.
+Explain important research findings.
+
+## Real-World Impacts and Applications
+
+Discuss supported real-world applications.
 
 ## Challenges and Limitations
-Explain challenges mentioned in the research notes.
+
+Explain challenges found in the research.
 
 ## Future Outlook
-Discuss future possibilities only when supported by
-the research notes.
+
+Discuss future possibilities only when supported
+by the research notes.
 
 ## Conclusion
-Provide a clear summary.
+
+Summarize the main points.
 
 ## References
-List the source titles and URLs supplied by the Researcher.
+
+Include source titles and URLs from the research notes.
 
 Return the final article in Markdown format.
 Do not include your internal reasoning.
 """
 
-    try:
+        try:
 
-        article = generate_with_retry(
-            prompt,
-            agent_name="Writer Agent"
-        )
+            article = generate_with_retry(
+                self.client,
+                prompt,
+                "Writer Agent"
+            )
 
-        return article
+            return article
 
-    except Exception as error:
+        except Exception as error:
 
-        return (
-            "# Article Generation Failed\n\n"
-            "The Writer Agent could not generate the article "
-            "because of a temporary or unexpected Gemini error.\n\n"
-            f"Error details: {str(error)}"
-        )
+            print(
+                f"Writer Agent Error: {error}",
+                flush=True
+            )
 
-
-# ============================================================
-# 8. ALTERNATIVE FUNCTION NAMES
-# ============================================================
-# These aliases allow other project files to call the agents
-# using common function names.
-
-run_researcher = researcher_agent
-run_writer = writer_agent
-research_agent = researcher_agent
-write_agent = writer_agent
+            return (
+                "# Article Generation Failed\n\n"
+                "The Writer Agent could not generate "
+                "the article after multiple attempts.\n\n"
+                f"Error: {error}"
+            )
